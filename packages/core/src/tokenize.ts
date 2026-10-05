@@ -90,6 +90,58 @@ type States = {
     RichText: 'rich-text';
 };
 
+// scanning
+
+// The character-by-character walk used to spend one recursive instantiation
+// per character of literal text, so any message over ~1000 characters crashed
+// the compiler with TS2589. Template-literal inference finds the first
+// occurrence of a delimiter without recursion, so outside of interpolations
+// we jump directly to the next interesting character instead.
+
+// [text before the first delimiter, delimiter, rest]; a delimiter that never
+// occurs produces the sentinel ['', '', ''] with the whole string as prefix.
+type SplitAt<S extends string, D extends string> =
+    S extends `${infer P}${D}${infer R}` ? [P, D, R] : [S, '', S];
+
+// The split whose delimiter occurs first. Both prefixes are prefixes of S, so
+// one always extends the other, and the shorter prefix wins.
+type Earlier<A extends [string, string, string], B extends [string, string, string]> =
+    A[0] extends `${B[0]}${string}` ? B : A;
+
+type NextEvent<S extends string> = Earlier<
+    Earlier<SplitAt<S, '{'>, SplitAt<S, '<'>>,
+    SplitAt<S, "'">
+>;
+
+type Scan<Tokens extends Token[], Translation extends string> = NextEvent<Translation> extends [
+    infer _Before extends string,
+    infer Delimiter extends string,
+    infer Rest extends string,
+]
+    ? Delimiter extends '{'
+        ? _Tokenize<
+              Tokens,
+              States['InterpolationStart'],
+              [],
+              [],
+              [],
+              [],
+              0,
+              Rest
+          >
+        : Delimiter extends '<'
+          ? _Tokenize<Tokens, States['RichText'], [], [], [], [], 0, Rest>
+          : Delimiter extends "'"
+            ? // A quote only escapes when it opens '{' or '<'; otherwise it is
+              // literal text and the scan resumes after it.
+              Rest extends `{${infer EscapedRest}`
+                ? _Tokenize<Tokens, States['Escaped'], [], [], [], [], 0, EscapedRest>
+                : Rest extends `<${infer EscapedRest}`
+                  ? _Tokenize<Tokens, States['Escaped'], [], [], [], [], 0, EscapedRest>
+                  : Scan<Tokens, Rest>
+            : Tokens
+    : Tokens;
+
 // tokenize
 
 type _BuildOptionsUnion<
@@ -111,11 +163,11 @@ type _Tokenize<
     CurlyBracketCounter extends number,
     Translation extends string,
 > = Translation extends `${infer Head}${infer Tail}`
-    ? State extends States['Start']
-        ? Head extends '{'
+    ? State extends States['InterpolationStart']
+        ? Head extends ','
             ? _Tokenize<
                   Tokens,
-                  States['InterpolationStart'],
+                  States['InterpolationType'],
                   NameBuffer,
                   TypeBuffer,
                   FormatBuffer,
@@ -123,65 +175,23 @@ type _Tokenize<
                   CurlyBracketCounter,
                   Tail
               >
-            : Head extends "'"
-              ? Tail extends `{${infer TailTail}`
-                  ? _Tokenize<
-                        Tokens,
-                        States['Escaped'],
-                        NameBuffer,
-                        TypeBuffer,
-                        FormatBuffer,
-                        OptionsBuffer,
-                        CurlyBracketCounter,
-                        TailTail
-                    >
-                  : Tail extends `<${infer TailTail}`
-                    ? _Tokenize<
-                          Tokens,
-                          States['Escaped'],
-                          NameBuffer,
-                          TypeBuffer,
-                          FormatBuffer,
-                          OptionsBuffer,
-                          CurlyBracketCounter,
-                          TailTail
-                      >
-                    : _Tokenize<
-                          Tokens,
-                          State,
-                          NameBuffer,
-                          TypeBuffer,
-                          FormatBuffer,
-                          OptionsBuffer,
-                          CurlyBracketCounter,
-                          Tail
-                      >
-              : Head extends '<'
-                ? _Tokenize<
-                      Tokens,
-                      States['RichText'],
-                      NameBuffer,
-                      TypeBuffer,
-                      FormatBuffer,
-                      OptionsBuffer,
-                      CurlyBracketCounter,
-                      Tail
-                  >
-                : _Tokenize<
-                      Tokens,
-                      State,
-                      NameBuffer,
-                      TypeBuffer,
-                      FormatBuffer,
-                      OptionsBuffer,
-                      CurlyBracketCounter,
-                      Tail
-                  >
-        : State extends States['InterpolationStart']
+            : Head extends '}'
+              ? Scan<[...Tokens, StringInterpolationToken<Join<NameBuffer>>], Tail>
+              : _Tokenize<
+                    Tokens,
+                    State,
+                    [...NameBuffer, Head],
+                    TypeBuffer,
+                    FormatBuffer,
+                    OptionsBuffer,
+                    CurlyBracketCounter,
+                    Tail
+                >
+        : State extends States['InterpolationType']
           ? Head extends ','
               ? _Tokenize<
                     Tokens,
-                    States['InterpolationType'],
+                    States['InterpolationFormat'],
                     NameBuffer,
                     TypeBuffer,
                     FormatBuffer,
@@ -189,101 +199,79 @@ type _Tokenize<
                     CurlyBracketCounter,
                     Tail
                 >
-              : Head extends '}'
-                ? _Tokenize<
-                      [...Tokens, StringInterpolationToken<Join<NameBuffer>>],
-                      States['Start'],
-                      [],
-                      [],
-                      [],
-                      [],
-                      CurlyBracketCounter,
-                      Tail
-                  >
-                : _Tokenize<
-                      Tokens,
-                      State,
-                      [...NameBuffer, Head],
-                      TypeBuffer,
-                      FormatBuffer,
-                      OptionsBuffer,
-                      CurlyBracketCounter,
-                      Tail
-                  >
-          : State extends States['InterpolationType']
-            ? Head extends ','
-                ? _Tokenize<
-                      Tokens,
-                      States['InterpolationFormat'],
-                      NameBuffer,
-                      TypeBuffer,
-                      FormatBuffer,
-                      OptionsBuffer,
-                      CurlyBracketCounter,
-                      Tail
-                  >
-                : Head extends '}'
-                  ? Trim<Join<TypeBuffer>> extends 'number'
-                      ? _Tokenize<
-                            [...Tokens, NumberInterpolationToken<Trim<Join<NameBuffer>>>],
-                            States['Start'],
-                            [],
-                            [],
-                            [],
-                            [],
-                            CurlyBracketCounter,
-                            Tail
-                        >
-                      : Trim<Join<TypeBuffer>> extends 'date'
-                        ? _Tokenize<
-                              [...Tokens, DateInterpolationToken<Trim<Join<NameBuffer>>>],
-                              States['Start'],
-                              [],
-                              [],
-                              [],
-                              [],
-                              CurlyBracketCounter,
-                              Tail
-                          >
-                        : Trim<Join<TypeBuffer>> extends 'time'
-                          ? _Tokenize<
-                                [...Tokens, TimeInterpolationToken<Trim<Join<NameBuffer>>>],
-                                States['Start'],
-                                [],
-                                [],
-                                [],
-                                [],
-                                CurlyBracketCounter,
-                                Tail
-                            >
-                          : 'unknown interpolation type'
+            : Head extends '}'
+              ? Trim<Join<TypeBuffer>> extends 'number'
+                  ? Scan<[...Tokens, NumberInterpolationToken<Trim<Join<NameBuffer>>>], Tail>
+                  : Trim<Join<TypeBuffer>> extends 'date'
+                    ? Scan<[...Tokens, DateInterpolationToken<Trim<Join<NameBuffer>>>], Tail>
+                    : Trim<Join<TypeBuffer>> extends 'time'
+                      ? Scan<[...Tokens, TimeInterpolationToken<Trim<Join<NameBuffer>>>], Tail>
+                      : 'unknown interpolation type'
+              : _Tokenize<
+                    Tokens,
+                    State,
+                    NameBuffer,
+                    [...TypeBuffer, Head],
+                    FormatBuffer,
+                    OptionsBuffer,
+                    CurlyBracketCounter,
+                    Tail
+                >
+          : State extends States['InterpolationFormat']
+            ? Trim<Join<TypeBuffer>> extends 'number'
+              ? Head extends '}'
+                  ? Scan<
+                        [
+                            ...Tokens,
+                            NumberFormatInterpolationToken<
+                                Trim<Join<NameBuffer>>,
+                                Trim<Join<FormatBuffer>>
+                            >,
+                        ],
+                        Tail
+                    >
                   : _Tokenize<
                         Tokens,
                         State,
                         NameBuffer,
-                        [...TypeBuffer, Head],
-                        FormatBuffer,
+                        TypeBuffer,
+                        [...FormatBuffer, Head],
                         OptionsBuffer,
                         CurlyBracketCounter,
                         Tail
                     >
-            : State extends States['InterpolationFormat']
-              ? Trim<Join<TypeBuffer>> extends 'number'
+              : Trim<Join<TypeBuffer>> extends 'date'
+                ? Head extends '}'
+                    ? Scan<
+                          [
+                              ...Tokens,
+                              DateFormatInterpolationToken<
+                                  Trim<Join<NameBuffer>>,
+                                  Trim<Join<FormatBuffer>>
+                              >,
+                          ],
+                          Tail
+                      >
+                    : _Tokenize<
+                          Tokens,
+                          State,
+                          NameBuffer,
+                          TypeBuffer,
+                          [...FormatBuffer, Head],
+                          OptionsBuffer,
+                          CurlyBracketCounter,
+                          Tail
+                      >
+                : Trim<Join<TypeBuffer>> extends 'time'
                   ? Head extends '}'
-                      ? _Tokenize<
+                      ? Scan<
                             [
                                 ...Tokens,
-                                NumberFormatInterpolationToken<
+                                TimeFormatInterpolationToken<
                                     Trim<Join<NameBuffer>>,
                                     Trim<Join<FormatBuffer>>
                                 >,
                             ],
-                            States['Start'],
-                            [],
-                            [],
-                            [],
-                            [],
-                            CurlyBracketCounter,
                             Tail
                         >
                       : _Tokenize<
@@ -296,211 +284,32 @@ type _Tokenize<
                             CurlyBracketCounter,
                             Tail
                         >
-                  : Trim<Join<TypeBuffer>> extends 'date'
-                    ? Head extends '}'
-                        ? _Tokenize<
-                              [
-                                  ...Tokens,
-                                  DateFormatInterpolationToken<
-                                      Trim<Join<NameBuffer>>,
-                                      Trim<Join<FormatBuffer>>
-                                  >,
-                              ],
-                              States['Start'],
-                              [],
-                              [],
-                              [],
-                              [],
-                              CurlyBracketCounter,
-                              Tail
-                          >
-                        : _Tokenize<
-                              Tokens,
-                              State,
-                              NameBuffer,
-                              TypeBuffer,
-                              [...FormatBuffer, Head],
-                              OptionsBuffer,
-                              CurlyBracketCounter,
-                              Tail
-                          >
-                    : Trim<Join<TypeBuffer>> extends 'time'
-                      ? Head extends '}'
-                          ? _Tokenize<
-                                [
-                                    ...Tokens,
-                                    TimeFormatInterpolationToken<
-                                        Trim<Join<NameBuffer>>,
-                                        Trim<Join<FormatBuffer>>
-                                    >,
-                                ],
-                                States['Start'],
-                                [],
-                                [],
-                                [],
-                                [],
-                                CurlyBracketCounter,
-                                Tail
-                            >
-                          : _Tokenize<
-                                Tokens,
-                                State,
-                                NameBuffer,
-                                TypeBuffer,
-                                [...FormatBuffer, Head],
-                                OptionsBuffer,
-                                CurlyBracketCounter,
-                                Tail
-                            >
-                      : Trim<Join<TypeBuffer>> extends 'select'
-                        ? _Tokenize<
-                              Tokens,
-                              States['SelectOptions'],
-                              NameBuffer,
-                              TypeBuffer,
-                              FormatBuffer,
-                              OptionsBuffer,
-                              CurlyBracketCounter,
-                              Tail
-                          >
-                        : Trim<Join<TypeBuffer>> extends 'plural'
-                          ? _Tokenize<
-                                Tokens,
-                                States['PluralOptions'],
-                                NameBuffer,
-                                TypeBuffer,
-                                FormatBuffer,
-                                OptionsBuffer,
-                                CurlyBracketCounter,
-                                Tail
-                            >
-                          : Trim<Join<TypeBuffer>> extends 'selectordinal'
-                            ? _Tokenize<
-                                  Tokens,
-                                  States['SelectOrdinalOptions'],
-                                  NameBuffer,
-                                  TypeBuffer,
-                                  FormatBuffer,
-                                  OptionsBuffer,
-                                  CurlyBracketCounter,
-                                  Tail
-                              >
-                            : 'unknown type'
-              : State extends
-                      | States['SelectOptions']
-                      | States['PluralOptions']
-                      | States['SelectOrdinalOptions']
-                ? Head extends '{'
+                  : Trim<Join<TypeBuffer>> extends 'select'
                     ? _Tokenize<
                           Tokens,
-                          State,
+                          States['SelectOptions'],
                           NameBuffer,
                           TypeBuffer,
                           FormatBuffer,
-                          [...OptionsBuffer, Head],
-                          Increment<CurlyBracketCounter>,
+                          OptionsBuffer,
+                          CurlyBracketCounter,
                           Tail
                       >
-                    : Head extends '}'
-                      ? CurlyBracketCounter extends 0
-                          ? State extends States['SelectOptions']
-                              ? _Tokenize<
-                                    [
-                                        ...Tokens,
-                                        SelectInterpolationToken<
-                                            Trim<Join<NameBuffer>>,
-                                            BuildOptionsUnion<Trim<Join<OptionsBuffer>>>
-                                        >,
-                                    ],
-                                    States['Start'],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    CurlyBracketCounter,
-                                    Tail
-                                >
-                              : State extends States['PluralOptions']
-                                ? _Tokenize<
-                                      [
-                                          ...Tokens,
-                                          PluralInterpolationToken<
-                                              Trim<Join<NameBuffer>>,
-                                              BuildOptionsUnion<Trim<Join<OptionsBuffer>>>
-                                          >,
-                                      ],
-                                      States['Start'],
-                                      [],
-                                      [],
-                                      [],
-                                      [],
-                                      CurlyBracketCounter,
-                                      Tail
-                                  >
-                                : State extends States['SelectOrdinalOptions']
-                                  ? _Tokenize<
-                                        [
-                                            ...Tokens,
-                                            SelectOrdinalInterpolationToken<
-                                                Trim<Join<NameBuffer>>,
-                                                BuildOptionsUnion<Trim<Join<OptionsBuffer>>>
-                                            >,
-                                        ],
-                                        States['Start'],
-                                        [],
-                                        [],
-                                        [],
-                                        [],
-                                        CurlyBracketCounter,
-                                        Tail
-                                    >
-                                  : 'unknown state'
-                          : _Tokenize<
-                                Tokens,
-                                State,
-                                NameBuffer,
-                                TypeBuffer,
-                                FormatBuffer,
-                                [...OptionsBuffer, Head],
-                                Decrement<CurlyBracketCounter>,
-                                Tail
-                            >
-                      : _Tokenize<
-                            Tokens,
-                            State,
-                            NameBuffer,
-                            TypeBuffer,
-                            FormatBuffer,
-                            [...OptionsBuffer, Head],
-                            CurlyBracketCounter,
-                            Tail
-                        >
-                : State extends States['Escaped']
-                  ? Tail extends `${string}}'${infer TailTail}`
+                    : Trim<Join<TypeBuffer>> extends 'plural'
                       ? _Tokenize<
                             Tokens,
-                            States['Start'],
+                            States['PluralOptions'],
                             NameBuffer,
                             TypeBuffer,
                             FormatBuffer,
                             OptionsBuffer,
                             CurlyBracketCounter,
-                            TailTail
+                            Tail
                         >
-                      : Tail extends `${string}>'${infer TailTail}`
+                      : Trim<Join<TypeBuffer>> extends 'selectordinal'
                         ? _Tokenize<
                               Tokens,
-                              States['Start'],
-                              NameBuffer,
-                              TypeBuffer,
-                              FormatBuffer,
-                              OptionsBuffer,
-                              CurlyBracketCounter,
-                              TailTail
-                          >
-                        : _Tokenize<
-                              Tokens,
-                              State,
+                              States['SelectOrdinalOptions'],
                               NameBuffer,
                               TypeBuffer,
                               FormatBuffer,
@@ -508,48 +317,109 @@ type _Tokenize<
                               CurlyBracketCounter,
                               Tail
                           >
-                  : State extends States['RichText']
-                    ? Head extends '>'
-                        ? Tail extends `${infer Children}</${Trim<
-                              Join<NameBuffer>
-                          >}>${infer TailTail}`
-                            ? _Tokenize<
+                        : 'unknown type'
+            : State extends
+                  | States['SelectOptions']
+                  | States['PluralOptions']
+                  | States['SelectOrdinalOptions']
+              ? // Option text can be long, so it is scanned brace-to-brace
+                // instead of character-by-character. The joined buffer string is
+                // identical to the character-by-character version.
+                Earlier<SplitAt<Translation, '{'>, SplitAt<Translation, '}'>> extends [
+                      infer Span extends string,
+                      infer Brace extends string,
+                      infer AfterBrace extends string,
+                  ]
+                  ? Brace extends '{'
+                      ? _Tokenize<
+                            Tokens,
+                            State,
+                            NameBuffer,
+                            TypeBuffer,
+                            FormatBuffer,
+                            [...OptionsBuffer, Span, '{'],
+                            Increment<CurlyBracketCounter>,
+                            AfterBrace
+                        >
+                      : Brace extends '}'
+                        ? CurlyBracketCounter extends 0
+                            ? State extends States['SelectOptions']
+                                ? Scan<
+                                      [
+                                          ...Tokens,
+                                          SelectInterpolationToken<
+                                              Trim<Join<NameBuffer>>,
+                                              BuildOptionsUnion<Trim<Join<[...OptionsBuffer, Span]>>>
+                                          >,
+                                      ],
+                                      AfterBrace
+                                  >
+                                : State extends States['PluralOptions']
+                                  ? Scan<
+                                        [
+                                            ...Tokens,
+                                            PluralInterpolationToken<
+                                                Trim<Join<NameBuffer>>,
+                                                BuildOptionsUnion<Trim<Join<[...OptionsBuffer, Span]>>>
+                                            >,
+                                        ],
+                                        AfterBrace
+                                    >
+                                  : State extends States['SelectOrdinalOptions']
+                                    ? Scan<
+                                          [
+                                              ...Tokens,
+                                              SelectOrdinalInterpolationToken<
+                                                  Trim<Join<NameBuffer>>,
+                                                  BuildOptionsUnion<Trim<Join<[...OptionsBuffer, Span]>>>
+                                              >,
+                                          ],
+                                          AfterBrace
+                                      >
+                                    : 'unknown state'
+                            : _Tokenize<
+                                  Tokens,
+                                  State,
+                                  NameBuffer,
+                                  TypeBuffer,
+                                  FormatBuffer,
+                                  [...OptionsBuffer, Span, '}'],
+                                  Decrement<CurlyBracketCounter>,
+                                  AfterBrace
+                              >
+                        : Tokens
+                  : Tokens
+              : State extends States['Escaped']
+                ? // A quote closes the escape only after '}' or '>'. The first
+                  // occurrence wins and template inference finds it without
+                  // walking the text.
+                  Translation extends `${string}}'${infer Rest}`
+                  ? Scan<Tokens, Rest>
+                  : Translation extends `${string}>'${infer Rest}`
+                    ? Scan<Tokens, Rest>
+                    : Tokens
+                : State extends States['RichText']
+                  ? SplitAt<Translation, '>'> extends [
+                        infer Tag extends string,
+                        infer Found extends string,
+                        infer AfterTag extends string,
+                    ]
+                      ? Found extends '>'
+                        ? AfterTag extends `${infer Children}</${Trim<Tag>}>${infer Rest}`
+                            ? Scan<
                                   [
                                       ...Tokens,
-                                      RichTextInterpolationToken<Trim<Join<NameBuffer>>>,
-                                      ..._Tokenize<
-                                          [],
-                                          States['Start'],
-                                          [],
-                                          [],
-                                          [],
-                                          [],
-                                          0,
-                                          Children
-                                      >,
+                                      RichTextInterpolationToken<Trim<Tag>>,
+                                      ...Scan<[], Children>,
                                   ],
-                                  States['Start'],
-                                  [],
-                                  [],
-                                  [],
-                                  [],
-                                  CurlyBracketCounter,
-                                  TailTail
+                                  Rest
                               >
                             : 'invalid rich text'
-                        : _Tokenize<
-                              Tokens,
-                              State,
-                              [...NameBuffer, Head],
-                              TypeBuffer,
-                              FormatBuffer,
-                              OptionsBuffer,
-                              CurlyBracketCounter,
-                              Tail
-                          >
-                    : 'unknown-state'
+                        : Tokens
+                      : Tokens
+                  : 'unknown-state'
     : Tokens;
 
 export type Tokenize<Translation extends string> = string extends Translation
     ? []
-    : _Tokenize<[], States['Start'], [], [], [], [], 0, Translation>;
+    : Scan<[], Translation>;
